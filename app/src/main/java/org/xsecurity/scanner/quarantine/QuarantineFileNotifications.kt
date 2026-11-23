@@ -55,6 +55,31 @@ object QuarantineFileNotifications {
         notify(context, notificationId(record.id), builder.build())
     }
 
+    /** Quota rejected the backup: alert the user without offering any action that could delete the original. */
+    fun showVaultQuotaExceeded(context: Context, record: QuarantineRecord) {
+        if (record.state != QuarantineState.VAULT_QUOTA_EXCEEDED) return
+        AutopilotNotifications.ensureChannels(context)
+        val title = resolve(context, QuarantineWording.KEY_NOTIF_VAULT_LIMIT_TITLE)
+        val body = resolve(context, QuarantineWording.KEY_NOTIF_VAULT_LIMIT_BODY)
+        val notification = NotificationCompat.Builder(context, AutopilotNotifications.CHANNEL_CRITICAL)
+            .setSmallIcon(R.drawable.ic_stat_shield)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentIntent(openQuarantineIntent(context))
+            .setOngoing(false)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .addAction(
+                R.drawable.ic_stat_shield,
+                resolve(context, QuarantineWording.KEY_ACTION_OPEN_QUARANTINE),
+                openQuarantineIntent(context)
+            )
+            .build()
+        notify(context, notificationId(record.id), notification)
+    }
+
     /** Original removed: replaces the ongoing prompt with a dismissible confirmation. */
     fun showRemoved(context: Context, record: QuarantineRecord) {
         if (!QuarantineHonesty.mayClaimFullQuarantine(record)) {
@@ -96,6 +121,9 @@ object QuarantineFileNotifications {
             QuarantineWording.KEY_NOTIF_STAGED_BODY -> R.string.quarantine_file_staged_body
             QuarantineWording.KEY_NOTIF_REMOVED_TITLE -> R.string.quarantine_file_removed_title
             QuarantineWording.KEY_NOTIF_REMOVED_BODY -> R.string.quarantine_file_removed_body
+            QuarantineWording.KEY_NOTIF_VAULT_LIMIT_TITLE -> R.string.quarantine_file_vault_limit_title
+            QuarantineWording.KEY_NOTIF_VAULT_LIMIT_BODY -> R.string.quarantine_file_vault_limit_body
+            QuarantineWording.KEY_VAULT_QUOTA_CARD_HINT -> R.string.quarantine_vault_quota_card_hint
             QuarantineWording.KEY_ACTION_DELETE_NOW -> R.string.quarantine_file_action_delete_now
             QuarantineWording.KEY_ACTION_OPEN_QUARANTINE -> R.string.autopilot_open_quarantine
             QuarantineWording.KEY_SCAN_RESULT_STAGED -> R.string.autopilot_file_vaulted

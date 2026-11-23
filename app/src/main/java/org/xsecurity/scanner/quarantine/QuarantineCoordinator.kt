@@ -19,18 +19,39 @@ object QuarantineCoordinator {
         signals: List<SecuritySignal>,
         capabilityProvider: CapabilityProvider,
         nowMillis: Long = System.currentTimeMillis()
-    ): QuarantineRecord? {
-        if (packageName.isBlank() || SystemPackageSafelist.isSystemPackage(context, packageName)) return null
+    ): QuarantineRecord? = synchronized(VaultStagingLock) {
+        if (packageName.isBlank() || SystemPackageSafelist.isSystemPackage(context, packageName)) return@synchronized null
         val app = InstalledAppsSource.loadOne(context, packageName)
         val label = app?.displayName ?: packageName
         val sourceApk = app?.apkPaths?.firstOrNull()?.let(::File)
         val installer = installerPackageName(context, packageName)
-        val vaultEntry = sourceApk?.takeIf { it.isFile }?.let { file ->
-            runCatching { FileVault.store(context, file, "q-${UUID.randomUUID()}") }
-                .getOrNull()
-        }
-        val sha256 = vaultEntry?.sha256 ?: sourceApk?.takeIf { it.isFile }
+        val sourceHash = sourceApk?.takeIf { it.isFile }
             ?.let { runCatching { Digest.sha256Hex(it) }.getOrNull() }
+        val reusable = sourceHash?.let { findReusableVaultRecord(context, it) }
+        val reusableName = reusable?.vaultFileName
+        val vaultEntry = when {
+            reusableName != null && sourceHash != null -> FileVault.StoredFile(reusableName, sourceHash)
+            sourceApk != null && sourceApk.isFile -> {
+                val stored = runCatching { FileVault.store(context, sourceApk, "q-${UUID.randomUUID()}") }
+                    .getOrNull()
+                if (stored == null) {
+                    null
+                } else {
+                    // A fallback digest (or an APK that changed between hashing and encryption)
+                    // can still collapse onto a previously backed-up blob. Drop only our own new
+                    // encrypted copy after the existing one has been verified.
+                    val matchingName = findReusableVaultRecord(context, stored.sha256)?.vaultFileName
+                    if (matchingName != null && matchingName != stored.fileName) {
+                        FileVault.delete(context, stored.fileName)
+                        FileVault.StoredFile(matchingName, stored.sha256)
+                    } else {
+                        stored
+                    }
+                }
+            }
+            else -> null
+        }
+        val sha256 = vaultEntry?.sha256 ?: sourceHash
         val engine = signals
             .filter { it.verdict == SecuritySignal.Verdict.KNOWN_BAD }
             .map { it.provider.name }
@@ -63,7 +84,7 @@ object QuarantineCoordinator {
             QuarantineActor.AUTOMATION,
             nowMillis
         )
-        if (pending !is QuarantineTransitionResult.Accepted) return QuarantineRepository.record(context, record.id)
+        if (pending !is QuarantineTransitionResult.Accepted) return@synchronized QuarantineRepository.record(context, record.id)
 
         val result = capabilityProvider.quarantine(context, packageName, record.id)
         when (result.state) {
@@ -112,7 +133,16 @@ object QuarantineCoordinator {
                 )
             }
         }
-        return QuarantineRepository.record(context, record.id)
+        QuarantineRepository.record(context, record.id)
+    }
+
+    private fun findReusableVaultRecord(context: Context, sha256: String): QuarantineRecord? {
+        val candidates = QuarantineRepository.quarantinedVaultRecordsBySha256(context, sha256)
+        return RecordDedup.findReusableVaultRecord(candidates, sha256)?.takeIf { candidate ->
+            candidate.vaultFileName?.let { fileName ->
+                FileVault.exists(context, fileName) && FileVault.verify(context, fileName, sha256)
+            } == true
+        }
     }
 
     private fun installerPackageName(context: Context, packageName: String): String? = try {

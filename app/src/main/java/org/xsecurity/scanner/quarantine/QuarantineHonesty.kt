@@ -24,8 +24,14 @@ enum class QuarantineDisplayState {
     /** File: encrypted copy in the vault, ORIGINAL STILL ON DEVICE. Never a "quarantined" claim. */
     FILE_COPY_SAVED_ORIGINAL_PRESENT,
 
+    /** File: the vault limit prevented a backup; the original remains unchanged on the device. */
+    VAULT_QUOTA_EXCEEDED,
+
     /** File: encrypted copy in the vault AND the original was removed. The only full claim. */
     FILE_QUARANTINED_ORIGINAL_REMOVED,
+
+    /** A quota-failure record was dismissed; no copy existed and the original remains. */
+    FILE_NO_COPY_RECORD_DELETED_ORIGINAL_PRESENT,
 
     RESTORED,
 
@@ -64,8 +70,15 @@ object QuarantineHonesty {
                 residue == OriginalResidue.ORIGINAL_REMOVED -> QuarantineDisplayState.FILE_QUARANTINED_ORIGINAL_REMOVED
                 else -> QuarantineDisplayState.FILE_COPY_SAVED_ORIGINAL_PRESENT
             }
+            QuarantineState.VAULT_QUOTA_EXCEEDED -> if (file) {
+                QuarantineDisplayState.VAULT_QUOTA_EXCEEDED
+            } else {
+                QuarantineDisplayState.FAILED
+            }
             QuarantineState.RESTORED -> QuarantineDisplayState.RESTORED
             QuarantineState.DELETED -> when {
+                file && residue == OriginalResidue.ORIGINAL_PRESENT && record.vaultFileName == null ->
+                    QuarantineDisplayState.FILE_NO_COPY_RECORD_DELETED_ORIGINAL_PRESENT
                 file && residue == OriginalResidue.ORIGINAL_PRESENT -> QuarantineDisplayState.FILE_COPY_DELETED_ORIGINAL_PRESENT
                 else -> QuarantineDisplayState.DELETED
             }

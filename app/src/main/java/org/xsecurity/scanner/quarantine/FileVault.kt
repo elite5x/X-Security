@@ -22,27 +22,44 @@ object FileVault {
     private const val DIRECTORY = "quarantine-vault"
     private const val KEY_ALIAS = "org.xsecurity.scanner.quarantine.filevault.v1"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val GCM_TAG_BYTES = 16L
     private val magic = byteArrayOf('X'.code.toByte(), 'S'.code.toByte(), 'V'.code.toByte(), '1'.code.toByte())
     private val keyLock = Any()
+    private val storageLock = Any()
     private val VAULT_NAME = Regex("[A-Za-z0-9-]{1,80}\\.xsv")
+    private val TEMP_NAME = Regex("[A-Za-z0-9-]{1,80}\\.tmp")
 
     data class StoredFile(val fileName: String, val sha256: String)
 
-    /** Encrypts a copy; never moves or deletes the source. */
+    /** Encrypts a copy; never moves or deletes the source. Both quotas are enforced while streaming. */
     @Throws(IOException::class)
-    fun store(context: Context, source: File, id: String): StoredFile {
+    fun store(context: Context, source: File, id: String): StoredFile = synchronized(storageLock) {
         require(id.matches(Regex("[A-Za-z0-9-]{1,80}"))) { "invalid vault id" }
         require(source.isFile && source.canRead()) { "source file is unavailable" }
-        val directory = vaultDirectory(context).apply { if (!isDirectory && !mkdirs()) throw IOException("vault directory unavailable") }
+        val directory = vaultDirectory(context).apply {
+            if (!isDirectory && !mkdirs()) throw IOException("vault directory unavailable")
+        }
         val targetName = "$id.xsv"
         val target = File(directory, targetName)
         val temporary = File(directory, "$id.tmp")
         if (target.exists()) throw IOException("vault entry already exists")
-        if (!temporary.createNewFile()) throw IOException("temporary vault entry already exists")
+
         val digest = MessageDigest.getInstance("SHA-256")
+        var temporaryCreated = false
         try {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+            cleanupOrphanedTemporaryFiles(directory)
+            val encryptedOverheadBytes = magic.size.toLong() + 1L + cipher.iv.size + GCM_TAG_BYTES
+            val usedVaultBytes = directoryBytes(directory)
+            val sourceBytes = source.length()
+            VaultStoragePolicy.preflightViolation(usedVaultBytes, sourceBytes, encryptedOverheadBytes)?.let {
+                throw VaultQuotaExceededException(it)
+            }
+            if (!temporary.createNewFile()) throw IOException("temporary vault entry already exists")
+            temporaryCreated = true
+
+            var plainBytesWritten = 0L
             FileOutputStream(temporary).use { raw ->
                 BufferedOutputStream(raw).use { output ->
                     output.write(magic)
@@ -54,17 +71,25 @@ object FileVault {
                             while (true) {
                                 val count = input.read(buffer)
                                 if (count < 0) break
+                                if (count == 0) continue
+                                VaultStoragePolicy.violation(
+                                    usedVaultBytes = usedVaultBytes,
+                                    plainBytesAlreadyWritten = plainBytesWritten,
+                                    nextPlainBytes = count.toLong(),
+                                    encryptedOverheadBytes = encryptedOverheadBytes
+                                )?.let { throw VaultQuotaExceededException(it) }
                                 digest.update(buffer, 0, count)
                                 encrypted.write(buffer, 0, count)
+                                plainBytesWritten += count
                             }
                         }
                     }
                 }
             }
             if (!temporary.renameTo(target)) throw IOException("encrypted vault entry could not be finalized")
-            return StoredFile(targetName, digest.digest().toHex())
+            StoredFile(targetName, digest.digest().toHex())
         } catch (error: Exception) {
-            runCatching { temporary.delete() }
+            if (temporaryCreated) runCatching { temporary.delete() }
             if (error is IOException) throw error
             throw IOException("vault encryption failed", error)
         }
@@ -105,12 +130,15 @@ object FileVault {
     fun exists(context: Context, fileName: String): Boolean =
         fileName.matches(VAULT_NAME) && File(vaultDirectory(context), fileName).isFile
 
+    /** Current recursive byte usage of the vault folder, including partial/orphan `.tmp` files. */
+    fun storageBytes(context: Context): Long = directoryBytes(vaultDirectory(context))
+
     /** Removes the encrypted entry; true when it no longer exists afterwards. */
-    fun delete(context: Context, fileName: String): Boolean {
-        if (!fileName.matches(VAULT_NAME)) return false
+    fun delete(context: Context, fileName: String): Boolean = synchronized(storageLock) {
+        if (!fileName.matches(VAULT_NAME)) return@synchronized false
         val entry = File(vaultDirectory(context), fileName)
-        if (!entry.exists()) return true
-        return entry.delete() || !entry.exists()
+        if (!entry.exists()) return@synchronized true
+        entry.delete() || !entry.exists()
     }
 
     @Throws(IOException::class)
@@ -162,6 +190,30 @@ object FileVault {
     }
 
     private fun vaultDirectory(context: Context): File = File(context.applicationContext.filesDir, DIRECTORY)
+
+    /** Removes incomplete encrypted staging files left by a process death; sources were never moved. */
+    private fun cleanupOrphanedTemporaryFiles(directory: File) {
+        val entries = directory.listFiles() ?: throw IOException("vault directory could not be listed")
+        entries.filter { it.isFile && TEMP_NAME.matches(it.name) }.forEach { temporary ->
+            if (!temporary.delete() && temporary.exists()) throw IOException("orphaned vault temporary file could not be removed")
+        }
+    }
+
+    private fun directoryBytes(directory: File): Long {
+        if (!directory.exists()) return 0L
+        var total = 0L
+        return try {
+            directory.walkTopDown().forEach { file ->
+                if (file.isFile) {
+                    val size = file.length()
+                    total = if (total > Long.MAX_VALUE - size) Long.MAX_VALUE else total + size
+                }
+            }
+            total
+        } catch (_: Exception) {
+            Long.MAX_VALUE // Fail closed if the full vault usage cannot be measured.
+        }
+    }
 
     private fun readFully(input: java.io.InputStream, destination: ByteArray) {
         var offset = 0

@@ -27,15 +27,26 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import org.xsecurity.scanner.R
 import org.xsecurity.scanner.autopilot.AutonomyLevel
 import org.xsecurity.scanner.autopilot.AutoPilotHealthScore
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.xsecurity.scanner.autopilot.AutopilotPermission
+import org.xsecurity.scanner.data.AppStorageSnapshot
+import org.xsecurity.scanner.data.AppStorageUsage
 import org.xsecurity.scanner.data.UpdateSettings
 
 /** Updates, AutoPilot policy, health and special-access rationale entry points. */
@@ -55,6 +66,19 @@ fun SettingsScreen(
     onRequestPermission: (AutopilotPermission) -> Unit,
     onBack: () -> Unit
 ) {
+    val appContext = LocalContext.current.applicationContext
+    var storageRefresh by remember { mutableStateOf(0) }
+    var storageSnapshot by remember { mutableStateOf<AppStorageSnapshot?>(null) }
+    LaunchedEffect(appContext, storageRefresh) {
+        storageSnapshot = try {
+            withContext(Dispatchers.IO) { AppStorageUsage.measure(appContext) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -225,6 +249,8 @@ fun SettingsScreen(
             }
         }
 
+        StorageUsageCard(storageSnapshot, onRefresh = { storageRefresh += 1 })
+
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
@@ -246,6 +272,72 @@ fun SettingsScreen(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun StorageUsageCard(snapshot: AppStorageSnapshot?, onRefresh: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                stringResource(R.string.settings_storage_title),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                stringResource(R.string.settings_storage_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (snapshot == null) {
+                Text(stringResource(R.string.settings_storage_loading), style = MaterialTheme.typography.bodySmall)
+            } else {
+                StorageUsageRow(R.string.settings_storage_total, snapshot.totalBytes)
+                StorageUsageRow(R.string.settings_storage_vault, snapshot.vaultBytes)
+                StorageUsageRow(R.string.settings_storage_signatures, snapshot.signaturesBytes)
+                StorageUsageRow(R.string.settings_storage_audit, snapshot.auditBytes)
+                StorageUsageRow(R.string.settings_storage_cache, snapshot.cacheBytes)
+                StorageUsageRow(R.string.settings_storage_other, snapshot.otherBytes)
+            }
+            TextButton(onClick = onRefresh) { Text(stringResource(R.string.settings_storage_refresh)) }
+        }
+    }
+}
+
+@Composable
+private fun StorageUsageRow(labelRes: Int, bytes: Long) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            stringResource(labelRes),
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodySmall
+        )
+        Text(formatStorageBytes(bytes), style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun formatStorageBytes(bytes: Long): String {
+    val safeBytes = bytes.coerceAtLeast(0L)
+    return when {
+        safeBytes < 1024L -> stringResource(R.string.settings_storage_size_b, safeBytes)
+        safeBytes < 1024L * 1024L ->
+            stringResource(R.string.settings_storage_size_kb, safeBytes.toDouble() / 1024.0)
+        safeBytes < 1024L * 1024L * 1024L ->
+            stringResource(R.string.settings_storage_size_mb, safeBytes.toDouble() / (1024.0 * 1024.0))
+        else ->
+            stringResource(R.string.settings_storage_size_gb, safeBytes.toDouble() / (1024.0 * 1024.0 * 1024.0))
     }
 }
 

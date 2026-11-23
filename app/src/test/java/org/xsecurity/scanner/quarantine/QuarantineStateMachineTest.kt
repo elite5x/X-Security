@@ -91,6 +91,28 @@ class QuarantineStateMachineTest {
     }
 
     @Test
+    fun vaultQuotaExceededIsDistinctAndCanOnlyBeDismissedByTheUser() {
+        val missingCode = QuarantineStateMachine.transition(
+            record(), QuarantineState.VAULT_QUOTA_EXCEEDED, 200, QuarantineActor.AUTOMATION
+        )
+        assertTrue(missingCode is QuarantineTransitionResult.Rejected)
+
+        val limited = QuarantineStateMachine.transition(
+            record(), QuarantineState.VAULT_QUOTA_EXCEEDED, 200, QuarantineActor.AUTOMATION, "vault_quota_exceeded"
+        ) as QuarantineTransitionResult.Accepted
+        assertEquals(QuarantineState.VAULT_QUOTA_EXCEEDED, limited.record.state)
+        assertEquals("vault_quota_exceeded", limited.record.failureCode)
+
+        assertTrue(
+            QuarantineStateMachine.transition(
+                limited.record, QuarantineState.DELETED, 300, QuarantineActor.AUTOMATION
+            ) is QuarantineTransitionResult.Rejected
+        )
+        val dismissed = accepted(limited.record, QuarantineState.DELETED, QuarantineActor.USER_ACTION, 300)
+        assertEquals(QuarantineState.DELETED, dismissed.state)
+    }
+
+    @Test
     fun bypassCannotBePermanentAndExpiresAtOrBefore24Hours() {
         val now = 1_000_000L
         val bypass = QuarantineBypass.issue("org.example.app", now, Long.MAX_VALUE)

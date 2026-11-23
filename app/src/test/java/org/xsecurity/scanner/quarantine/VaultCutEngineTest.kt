@@ -312,6 +312,50 @@ class VaultCutEngineTest {
     }
 
     @Test
+    fun quotaFailureCannotCutOrDeleteTheOriginalEvenIfACallerRequestsIt() {
+        val staged = stage("limited.apk")
+        val quotaRecord = staged.copy(
+            state = QuarantineState.VAULT_QUOTA_EXCEEDED,
+            failureCode = "vault_quota_exceeded",
+            vaultFileName = null,
+            residue = OriginalResidue.ORIGINAL_PRESENT
+        )
+        records.map[staged.id] = quotaRecord
+
+        assertEquals(
+            DeleteOutcome.Failed(CutResultCodes.FAILED_NOT_QUARANTINED),
+            engine.deleteRecord(staged.id, alsoDeleteOriginal = true, nowMillis = 200)
+        )
+        assertTrue(File(staged.sourcePath!!).isFile)
+        assertEquals(
+            CutOutcome.Failed(CutResultCodes.FAILED_NOT_QUARANTINED),
+            engine.cut(staged.id, nowMillis = 300)
+        )
+    }
+
+    @Test
+    fun sharedEncryptedCopySurvivesRestoreUntilTheLastRecordReleasesIt() {
+        val first = stage("first.apk")
+        val secondOriginal = File(downloadsDir, "same-bytes-different-path.apk").apply { writeBytes(payload) }
+        val second = first.copy(
+            id = "rec-second",
+            label = secondOriginal.name,
+            sourcePath = secondOriginal.absolutePath,
+            sourceUri = "file://${secondOriginal.absolutePath}"
+        )
+        records.map[second.id] = second
+        val sharedVaultFile = first.vaultFileName!!
+
+        assertTrue(engine.restore(first.id, nowMillis = 200) is RestoreOutcome.Restored)
+        assertTrue("another live record still needs the shared blob", vault.entries.containsKey(sharedVaultFile))
+        assertEquals(QuarantineState.RESTORED, records.map.getValue(first.id).state)
+        assertEquals(QuarantineState.QUARANTINED, records.map.getValue(second.id).state)
+
+        assertTrue(engine.deleteRecord(second.id, alsoDeleteOriginal = false, nowMillis = 300) is DeleteOutcome.Deleted)
+        assertFalse("the last release removes the encrypted blob", vault.entries.containsKey(sharedVaultFile))
+    }
+
+    @Test
     fun packageRecordsAreRejectedByTheFileFlow() {
         val pkg = stage().copy(id = "pkg", packageName = "org.example.app")
         records.map[pkg.id] = pkg
@@ -447,6 +491,12 @@ class VaultCutEngineTest {
             if (result is QuarantineTransitionResult.Accepted) map[id] = result.record
             return result
         }
+
+        override fun hasOtherVaultReferences(fileName: String, excludingRecordId: String): Boolean =
+            map.values.any { record ->
+                record.id != excludingRecordId && record.vaultFileName == fileName &&
+                    record.state !in setOf(QuarantineState.RESTORED, QuarantineState.DELETED, QuarantineState.CANCELLED)
+            }
 
         override fun updateRestoreInfo(id: String, restoreInfo: String, nowMillis: Long) {
             map[id]?.let { map[id] = it.copy(restoreInfo = restoreInfo, updatedAtMillis = nowMillis) }

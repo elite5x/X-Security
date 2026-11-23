@@ -34,6 +34,7 @@ class RecordDedupTest {
         updatedAtMillis = 1_000L,
         state = state,
         vaultFileName = "$id.xsv",
+        sizeBytes = 4096L,
         residue = OriginalResidue.ORIGINAL_PRESENT,
         sourcePath = sourcePath,
         sourceUri = sourceUri
@@ -112,6 +113,43 @@ class RecordDedupTest {
     }
 
     @Test
+    fun sameHashReusesAnExistingQuarantinedBlobWithoutCreatingAnotherCopy() {
+        val legacyLarge = record(id = "legacy-large").copy(sizeBytes = VaultStoragePolicy.MAX_SINGLE_FILE_BYTES + 1L)
+        val failed = record(id = "failed", state = QuarantineState.FAILED)
+        val reusable = record(id = "reusable")
+
+        assertEquals(
+            "legacy-large",
+            RecordDedup.findReusableVaultRecord(listOf(legacyLarge, failed, reusable), sha)?.id
+        )
+        assertNull(RecordDedup.findReusableVaultRecord(listOf(failed), sha))
+        assertNull(RecordDedup.findReusableVaultRecord(listOf(reusable), "f".repeat(64)))
+    }
+
+    @Test
+    fun quotaFailureRecordMakesNoVaultCopyAndKeepsTheOriginalPresent() {
+        val limited = RecordDedup.vaultQuotaExceeded(
+            existing = record(),
+            sha256 = sha,
+            label = "too-large.apk",
+            engine = "YARA",
+            sizeBytes = 101L * 1024L * 1024L,
+            scanOrigin = QuarantineFormat.ORIGIN_DOWNLOAD_WATCH,
+            sourcePath = path,
+            sourceUri = "file://$path",
+            failureCode = VaultQuotaViolation.FILE_TOO_LARGE.failureCode,
+            nowMillis = 8_000L
+        )
+
+        assertEquals(QuarantineState.VAULT_QUOTA_EXCEEDED, limited.state)
+        assertEquals("vault_file_too_large", limited.failureCode)
+        assertNull(limited.vaultFileName)
+        assertEquals(OriginalResidue.ORIGINAL_PRESENT, limited.residue)
+        assertEquals(8_000L, limited.updatedAtMillis)
+        assertEquals(path, limited.sourcePath)
+    }
+
+    @Test
     fun differentBytesAtTheSamePathStaysASeparateRecord() {
         val store = mutableListOf(record())
         applyObservation(store, "f".repeat(64), path, "file://$path", nowMillis = 3_000L)
@@ -146,5 +184,14 @@ class RecordDedupTest {
         )
         assertFalse(RecordDedup.isSameCase(packageRecord, sha, path, "file://$path"))
         assertNull(RecordDedup.findExisting(listOf(packageRecord), sha, path, "file://$path"))
+    }
+
+    @Test
+    fun packageApkBlobCanBeReusedWithoutMergingItsRecordWithAFileRecord() {
+        val packageRecord = record(id = "q-1").copy(packageName = "com.evil.spy")
+
+        assertFalse(RecordDedup.isSameCase(packageRecord, sha, path, "file://$path"))
+        assertEquals(packageRecord, RecordDedup.findReusableVaultRecord(listOf(packageRecord), sha))
+        assertNull(RecordDedup.findReusableVaultRecord(listOf(packageRecord.copy(state = QuarantineState.RESTORED)), sha))
     }
 }

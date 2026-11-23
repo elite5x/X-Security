@@ -1,7 +1,7 @@
 package org.xsecurity.scanner.quarantine
 
 /** Persisted state for an encrypted, best-effort soft-quarantine record. */
-enum class QuarantineState { DETECTED, PENDING, QUARANTINED, RESTORED, DELETED, FAILED, CANCELLED }
+enum class QuarantineState { DETECTED, PENDING, QUARANTINED, RESTORED, DELETED, FAILED, VAULT_QUOTA_EXCEEDED, CANCELLED }
 
 enum class QuarantineActor { AUTOMATION, USER_ACTION, PLATFORM_OBSERVATION }
 
@@ -68,23 +68,25 @@ object QuarantineStateMachine {
         }
 
         val allowed = when (record.state) {
-            QuarantineState.DETECTED -> to == QuarantineState.PENDING || to == QuarantineState.FAILED
+            QuarantineState.DETECTED -> to == QuarantineState.PENDING || to == QuarantineState.FAILED ||
+                to == QuarantineState.VAULT_QUOTA_EXCEEDED
             QuarantineState.PENDING -> to == QuarantineState.QUARANTINED || to == QuarantineState.FAILED ||
                 to == QuarantineState.CANCELLED || to == QuarantineState.DELETED
             QuarantineState.QUARANTINED -> to == QuarantineState.RESTORED || to == QuarantineState.DELETED
             QuarantineState.FAILED -> to == QuarantineState.PENDING || to == QuarantineState.RESTORED ||
                 to == QuarantineState.DELETED
+            QuarantineState.VAULT_QUOTA_EXCEEDED -> to == QuarantineState.DELETED
             QuarantineState.RESTORED, QuarantineState.DELETED, QuarantineState.CANCELLED -> false
         }
         if (!allowed) return QuarantineTransitionResult.Rejected("invalid_${record.state.name.lowercase()}_to_${to.name.lowercase()}")
-        if (to == QuarantineState.FAILED && failureCode.isNullOrBlank()) {
+        if (to in setOf(QuarantineState.FAILED, QuarantineState.VAULT_QUOTA_EXCEEDED) && failureCode.isNullOrBlank()) {
             return QuarantineTransitionResult.Rejected("failed_state_requires_failure_code")
         }
         return QuarantineTransitionResult.Accepted(
             record.copy(
                 state = to,
                 updatedAtMillis = nowMillis,
-                failureCode = if (to == QuarantineState.FAILED) failureCode else null
+                failureCode = if (to == QuarantineState.FAILED || to == QuarantineState.VAULT_QUOTA_EXCEEDED) failureCode else null
             )
         )
     }

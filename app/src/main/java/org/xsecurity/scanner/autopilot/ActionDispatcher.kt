@@ -52,6 +52,17 @@ class ActionDispatcher(
                     // The original is removed solely by the user's "Delete now" tap
                     // (VaultDeleteFlow.cut), never here, at any autonomy level.
                     val record = VaultDeleteFlow.stage(appContext, event)
+                    if (record != null && record.state == QuarantineState.VAULT_QUOTA_EXCEEDED) {
+                        appendActionFailure(
+                            appContext,
+                            event,
+                            signals,
+                            autonomy,
+                            record.failureCode ?: "vault_quota_exceeded"
+                        )
+                        QuarantineFileNotifications.showVaultQuotaExceeded(appContext, record)
+                        return Result.ACTION_FAILED
+                    }
                     if (record == null || record.state != QuarantineState.QUARANTINED) {
                         appendActionFailure(appContext, event, signals, autonomy, "file_vault_failed")
                         AutopilotNotifications.showDecision(appContext, event, PolicyDecision(PolicyAction.ASK_USER, "file_vault_failed", notify = true))

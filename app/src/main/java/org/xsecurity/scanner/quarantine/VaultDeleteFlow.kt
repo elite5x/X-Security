@@ -45,70 +45,114 @@ import java.util.concurrent.TimeUnit
  */
 object VaultDeleteFlow {
     const val TAG = "xsec-vault-cut"
+    private val sha256Pattern = Regex("(?i)[0-9a-f]{64}")
 
-    /** Non-destructive staging after a known-bad verdict. Null when nothing could be vaulted. */
-    fun stage(context: Context, event: SecurityEvent.FileScan): QuarantineRecord? {
+    /** Non-destructive staging after a known-bad verdict. Quota failure is recorded without touching the source. */
+    fun stage(context: Context, event: SecurityEvent.FileScan): QuarantineRecord? = synchronized(VaultStagingLock) {
         val appContext = context.applicationContext
         val scanned = File(event.path)
-        val id = "f-${UUID.randomUUID()}"
-        val stored = try {
-            FileVault.store(appContext, scanned, id)
-        } catch (_: Exception) {
-            return null
-        }
-        if (event.sha256 != null && !stored.sha256.equals(event.sha256, ignoreCase = true)) {
-            // The file changed between scan and vaulting: do not vault something we never scanned.
-            FileVault.delete(appContext, stored.fileName)
-            return null
-        }
-        if (!FileVault.verify(appContext, stored.fileName, stored.sha256)) {
-            FileVault.delete(appContext, stored.fileName)
-            return null
-        }
+        if (!scanned.isFile || !scanned.canRead()) return@synchronized null
         val source = SourceLocation.resolve(appContext, event.sourceUri, scanned)
-        // Real file name (real extension) from the ORIGINAL location; never the staged copy name
-        // (`<sha256>.apk`) or a vault entry name — see RecordLabel.
-        val label = RecordLabel.derive(source.path, source.uri)
-            ?: source.displayName?.takeIf { !RecordLabel.isPlaceholder(it, stored.sha256, stored.fileName) }
-            ?: RecordLabel.UNKNOWN_FILENAME
-        val sizeBytes = scanned.length().takeIf { it > 0L }
+        val sizeAtScan = scanned.length()
+        val sizeBytes = sizeAtScan.takeIf { it > 0L }
         val scanOrigin = QuarantineFormat.normalizeOrigin(event.origin)
+        val label = RecordLabel.derive(source.path, source.uri)
+            ?: source.displayName?.takeIf { !RecordLabel.isPlaceholder(it, event.sha256, scanned.name) }
+            ?: RecordLabel.UNKNOWN_FILENAME
 
-        // RECORD DEDUP (P0): the same bytes from the same location are the same case. Re-scanning
-        // updates that row (new timestamps/state, new vault copy) instead of appending a second one.
-        val existing = QuarantineRepository.findFileRecordByIdentity(
-            appContext, stored.sha256, source.path, source.uri
-        )
+        // The scanner normally supplies this digest. For legacy events, hash only files that could
+        // be newly stored; an oversized file without a digest is rejected without another full read.
+        val shaForLookup = event.sha256?.takeIf { sha256Pattern.matches(it) }
+            ?: if (event.sha256.isNullOrBlank() && sizeAtScan <= VaultStoragePolicy.MAX_SINGLE_FILE_BYTES) {
+                runCatching { VaultCutEngine.sha256(scanned) }.getOrNull()
+            } else {
+                null
+            }
+        val existing = shaForLookup?.let {
+            QuarantineRepository.findFileRecordByIdentity(appContext, it, source.path, source.uri)
+        }
+        val reusable = shaForLookup?.let { hash ->
+            val candidates = QuarantineRepository.quarantinedVaultRecordsBySha256(appContext, hash)
+            val candidate = RecordDedup.findReusableVaultRecord(candidates, hash)
+            val sourceStillMatches = runCatching { VaultCutEngine.sha256(scanned).equals(hash, ignoreCase = true) }
+                .getOrDefault(false)
+            candidate?.takeIf {
+                sourceStillMatches && it.vaultFileName?.let { fileName ->
+                    FileVault.exists(appContext, fileName) && FileVault.verify(appContext, fileName, hash)
+                } == true
+            }
+        }
+        val reusableName = reusable?.vaultFileName
+        val vaultFileName: String
+        val storedSha256: String
+        if (reusableName != null && shaForLookup != null) {
+            // Same bytes already have a currently verified encrypted object. Keep a separate
+            // source record when paths differ; the vault adapter retains the shared blob until the
+            // last non-terminal record is restored or dismissed.
+            vaultFileName = reusableName
+            storedSha256 = shaForLookup
+        } else {
+            val stored = try {
+                FileVault.store(appContext, scanned, "f-${UUID.randomUUID()}")
+            } catch (error: VaultQuotaExceededException) {
+                return@synchronized recordQuotaExceeded(
+                    appContext, event, shaForLookup, source, label, sizeBytes, scanOrigin,
+                    error.violation.failureCode
+                )
+            } catch (_: Exception) {
+                return@synchronized null
+            }
+            if ((event.sha256 != null && !stored.sha256.equals(event.sha256, ignoreCase = true)) ||
+                (shaForLookup != null && !stored.sha256.equals(shaForLookup, ignoreCase = true))
+            ) {
+                // The staged bytes changed after scanning/pre-hashing; discard only our new copy.
+                FileVault.delete(appContext, stored.fileName)
+                return@synchronized null
+            }
+            if (!FileVault.verify(appContext, stored.fileName, stored.sha256)) {
+                FileVault.delete(appContext, stored.fileName)
+                return@synchronized null
+            }
+            vaultFileName = stored.fileName
+            storedSha256 = stored.sha256
+        }
+
+        // RECORD DEDUP: same bytes from the same location update one row; different paths remain
+        // separately actionable, while an eligible QUARANTINED row may supply their shared blob.
+        val sameCase = QuarantineRepository.findFileRecordByIdentity(
+            appContext, storedSha256, source.path, source.uri
+        ) ?: existing
         val now = System.currentTimeMillis()
-        val record = if (existing != null) {
-            // The superseded vault copy is only dropped once the new one verified above.
-            existing.vaultFileName
-                ?.takeIf { it != stored.fileName }
-                ?.let { FileVault.delete(appContext, it) }
-            QuarantineRepository.saveReobserved(
+        val record = if (sameCase != null) {
+            val previousVaultFile = sameCase.vaultFileName
+            val updated = QuarantineRepository.saveReobserved(
                 appContext,
                 RecordDedup.reobserved(
-                    existing = existing,
-                    sha256 = stored.sha256,
+                    existing = sameCase,
+                    sha256 = storedSha256,
                     label = label,
                     engine = event.engine,
                     sizeBytes = sizeBytes,
                     scanOrigin = scanOrigin,
-                    vaultFileName = stored.fileName,
+                    vaultFileName = vaultFileName,
                     sourcePath = source.path,
                     sourceUri = source.uri,
                     nowMillis = now
                 )
             )
+            if (previousVaultFile != null && previousVaultFile != vaultFileName) {
+                deleteVaultIfUnreferenced(appContext, previousVaultFile)
+            }
+            updated
         } else {
             val created = QuarantineRepository.newRecord(
                 packageName = QuarantineHonesty.FILE_VAULT_PACKAGE,
                 label = label,
-                sha256 = stored.sha256,
+                sha256 = storedSha256,
                 verdict = "KNOWN_BAD",
                 engine = event.engine.ifBlank { "unknown" },
                 nowMillis = now,
-                vaultFileName = stored.fileName,
+                vaultFileName = vaultFileName,
                 restoreInfo = "encrypted_file_vault",
                 residue = OriginalResidue.ORIGINAL_PRESENT,
                 sourceUri = source.uri,
@@ -126,7 +170,84 @@ object VaultDeleteFlow {
                 appContext, record.id, OriginalResidue.ORIGINAL_PRESENT, CutResultCodes.FAILED_LOCATION_UNKNOWN
             )
         }
-        return QuarantineRepository.record(appContext, record.id)
+        QuarantineRepository.record(appContext, record.id)
+    }
+
+    private fun recordQuotaExceeded(
+        context: Context,
+        event: SecurityEvent.FileScan,
+        sha256: String?,
+        source: SourceLocation,
+        label: String,
+        sizeBytes: Long?,
+        scanOrigin: String,
+        failureCode: String
+    ): QuarantineRecord? {
+        val existing = sha256?.let {
+            QuarantineRepository.findFileRecordByIdentity(context, it, source.path, source.uri)
+        }
+        // Do not downgrade or delete a previously saved recovery copy on a later quota failure.
+        val existingVaultFile = existing?.vaultFileName
+        if (existing != null && existingVaultFile != null &&
+            FileVault.exists(context, existingVaultFile) && FileVault.verify(context, existingVaultFile, existing.sha256)
+        ) return existing
+
+        val now = System.currentTimeMillis()
+        val record = if (existing != null) {
+            QuarantineRepository.saveReobserved(
+                context,
+                RecordDedup.vaultQuotaExceeded(
+                    existing = existing,
+                    sha256 = sha256,
+                    label = label,
+                    engine = event.engine,
+                    sizeBytes = sizeBytes,
+                    scanOrigin = scanOrigin,
+                    sourcePath = source.path,
+                    sourceUri = source.uri,
+                    failureCode = failureCode,
+                    nowMillis = now
+                )
+            )
+        } else {
+            val created = QuarantineRepository.newRecord(
+                packageName = QuarantineHonesty.FILE_VAULT_PACKAGE,
+                label = label,
+                sha256 = sha256,
+                verdict = "KNOWN_BAD",
+                engine = event.engine.ifBlank { "unknown" },
+                nowMillis = now,
+                restoreInfo = "encrypted_file_vault_not_saved",
+                residue = OriginalResidue.ORIGINAL_PRESENT,
+                sourceUri = source.uri,
+                sourcePath = source.path,
+                sizeBytes = sizeBytes,
+                scanOrigin = scanOrigin
+            )
+            QuarantineRepository.insert(context, created)
+            val transition = QuarantineRepository.transition(
+                context,
+                created.id,
+                QuarantineState.VAULT_QUOTA_EXCEEDED,
+                QuarantineActor.AUTOMATION,
+                now,
+                failureCode
+            )
+            if (transition !is QuarantineTransitionResult.Accepted) return null
+            transition.record
+        }
+        if (source.uri == null && source.path == null) {
+            QuarantineRepository.updateResidue(
+                context, record.id, OriginalResidue.ORIGINAL_PRESENT, failureCode
+            )
+        }
+        return QuarantineRepository.record(context, record.id)
+    }
+
+    private fun deleteVaultIfUnreferenced(context: Context, fileName: String) {
+        if (!QuarantineRepository.hasOtherVaultReferences(context, fileName, excludingRecordId = "")) {
+            FileVault.delete(context, fileName)
+        }
     }
 
     fun engine(context: Context): VaultCutEngine {
@@ -137,7 +258,7 @@ object VaultDeleteFlow {
     /** The user tapped "Delete now" (in-app confirmation already given by that tap). */
     fun cut(context: Context, recordId: String): CutOutcome {
         val appContext = context.applicationContext
-        val outcome = engine(appContext).cut(recordId)
+        val outcome = synchronized(VaultStagingLock) { engine(appContext).cut(recordId) }
         afterCut(appContext, recordId, outcome, "user_delete_original")
         return outcome
     }
@@ -150,14 +271,16 @@ object VaultDeleteFlow {
         confirmed: Boolean
     ): CutOutcome {
         val appContext = context.applicationContext
-        val outcome = engine(appContext).completeUserConfirmation(recordId, route, confirmed)
+        val outcome = synchronized(VaultStagingLock) {
+            engine(appContext).completeUserConfirmation(recordId, route, confirmed)
+        }
         afterCut(appContext, recordId, outcome, if (confirmed) "user_confirmed_system_delete" else "user_denied_system_delete")
         return outcome
     }
 
     fun restore(context: Context, recordId: String): RestoreOutcome {
         val appContext = context.applicationContext
-        val outcome = engine(appContext).restore(recordId)
+        val outcome = synchronized(VaultStagingLock) { engine(appContext).restore(recordId) }
         when (outcome) {
             is RestoreOutcome.Restored -> {
                 SourceGrants.release(appContext, QuarantineRepository.record(appContext, recordId)?.sourceUri)
@@ -171,7 +294,9 @@ object VaultDeleteFlow {
 
     fun deleteRecord(context: Context, recordId: String, alsoDeleteOriginal: Boolean): DeleteOutcome {
         val appContext = context.applicationContext
-        val outcome = engine(appContext).deleteRecord(recordId, alsoDeleteOriginal)
+        val outcome = synchronized(VaultStagingLock) {
+            engine(appContext).deleteRecord(recordId, alsoDeleteOriginal)
+        }
         when (outcome) {
             is DeleteOutcome.Deleted -> {
                 SourceGrants.release(appContext, QuarantineRepository.record(appContext, recordId)?.sourceUri)
@@ -374,6 +499,9 @@ internal class RepositoryRecordPort(private val context: Context) : RecordPort {
         nowMillis: Long,
         failureCode: String?
     ): QuarantineTransitionResult = QuarantineRepository.transition(context, id, state, actor, nowMillis, failureCode)
+
+    override fun hasOtherVaultReferences(fileName: String, excludingRecordId: String): Boolean =
+        QuarantineRepository.hasOtherVaultReferences(context, fileName, excludingRecordId)
 
     override fun updateRestoreInfo(id: String, restoreInfo: String, nowMillis: Long) {
         QuarantineRepository.updateRestoreInfo(context, id, restoreInfo, nowMillis)

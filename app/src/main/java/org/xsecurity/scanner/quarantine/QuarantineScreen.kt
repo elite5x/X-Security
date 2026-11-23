@@ -157,7 +157,11 @@ fun QuarantineScreen(
                                 text = stringResource(R.string.quarantine_state, stateText),
                                 style = MaterialTheme.typography.bodyMedium
                             )
-                            if (isFile && residue != null && record.state == QuarantineState.QUARANTINED) {
+                            if (isFile && residue != null && record.state in setOf(
+                                    QuarantineState.QUARANTINED,
+                                    QuarantineState.VAULT_QUOTA_EXCEEDED
+                                )
+                            ) {
                                 Text(
                                     text = QuarantineFileNotifications.resolve(context, QuarantineWording.residueKey(residue)),
                                     style = MaterialTheme.typography.bodyMedium,
@@ -175,6 +179,13 @@ fun QuarantineScreen(
                                     }
                                 }
                             }
+                            if (record.state == QuarantineState.VAULT_QUOTA_EXCEEDED) {
+                                Text(
+                                    QuarantineFileNotifications.resolve(context, QuarantineWording.KEY_VAULT_QUOTA_CARD_HINT),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                             if (safelistedSystem) {
                                 Text(
                                     text = stringResource(R.string.scan_result_system_package_notice),
@@ -190,7 +201,13 @@ fun QuarantineScreen(
                             }
                             Text(stringResource(R.string.quarantine_engine, record.engine))
                             Text(stringResource(R.string.quarantine_detected, formatter.format(Date(record.detectedAtMillis))))
-                            record.failureCode?.let { Text(stringResource(R.string.quarantine_failed, failureLabel(it))) }
+                            record.failureCode?.let { code ->
+                                if (record.state == QuarantineState.VAULT_QUOTA_EXCEEDED) {
+                                    Text(failureLabel(code), style = MaterialTheme.typography.bodySmall)
+                                } else {
+                                    Text(stringResource(R.string.quarantine_failed, failureLabel(code)))
+                                }
+                            }
                             if (safelistedSystem) {
                                 // Metadata only: no uninstall, no bypass, no retry, no restore.
                                 if (record.state == QuarantineState.QUARANTINED || record.state == QuarantineState.FAILED) {
@@ -231,6 +248,13 @@ fun QuarantineScreen(
                                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                                 OutlinedButton(onClick = { onRetry(record) }) { Text(stringResource(R.string.quarantine_retry)) }
                                                 Button(onClick = { onUninstall(record) }) { Text(stringResource(R.string.action_uninstall)) }
+                                            }
+                                        }
+                                    }
+                                    QuarantineState.VAULT_QUOTA_EXCEEDED -> {
+                                        if (isFile) {
+                                            OutlinedButton(onClick = { onDeleteRecord(record) }) {
+                                                Text(stringResource(R.string.quarantine_delete_record))
                                             }
                                         }
                                     }
@@ -317,6 +341,7 @@ private fun stateLabel(state: QuarantineState): String = when (state) {
     QuarantineState.RESTORED -> stringResource(R.string.quarantine_state_restored)
     QuarantineState.DELETED -> stringResource(R.string.quarantine_state_deleted)
     QuarantineState.FAILED -> stringResource(R.string.quarantine_state_failed)
+    QuarantineState.VAULT_QUOTA_EXCEEDED -> stringResource(R.string.quarantine_state_vault_quota_exceeded)
     QuarantineState.CANCELLED -> stringResource(R.string.quarantine_state_cancelled)
 }
 
@@ -326,5 +351,7 @@ private fun failureLabel(code: String): String = when (code) {
     "package_not_installed" -> stringResource(R.string.quarantine_failure_missing)
     "oem_accessibility_action_not_confirmed", "rootless_force_stop_unavailable" ->
         stringResource(R.string.quarantine_failure_oem)
+    "vault_file_too_large" -> stringResource(R.string.quarantine_failure_vault_file_too_large)
+    "vault_quota_exceeded" -> stringResource(R.string.quarantine_failure_vault_full)
     else -> stringResource(R.string.quarantine_failure_generic)
 }
