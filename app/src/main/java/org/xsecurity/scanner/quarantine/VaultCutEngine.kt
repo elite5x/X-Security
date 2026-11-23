@@ -73,6 +73,9 @@ interface RecordPort {
         failureCode: String? = null
     ): QuarantineTransitionResult
 
+    /** Whether another non-terminal row still points at this shared encrypted file. */
+    fun hasOtherVaultReferences(fileName: String, excludingRecordId: String): Boolean
+
     fun updateRestoreInfo(id: String, restoreInfo: String, nowMillis: Long)
 }
 
@@ -93,6 +96,12 @@ sealed class DeleteOutcome {
     data class NeedsUserConfirmation(val token: Any, val route: VaultCutPolicy.Route) : DeleteOutcome()
     object Denied : DeleteOutcome()
     data class Failed(val code: String) : DeleteOutcome()
+}
+
+enum class VaultReleaseResult(val restoreInfoCode: String) {
+    DELETED("removed"),
+    RETAINED_SHARED("retained_shared"),
+    FAILED("removal_failed")
 }
 
 /**
@@ -213,20 +222,22 @@ class VaultCutEngine(
             scratch.delete()
             return RestoreOutcome.Failed(CutResultCodes.RESTORE_WRITE_FAILED)
         }
-        // "Move", not "copy": exactly one plaintext copy and no vault copy remain.
+        // "Move", not "copy": exactly one plaintext copy remains. Commit the user-requested
+        // restore before releasing the shared blob so concurrent restores cannot strand an orphan.
         if (scratch.exists()) scratch.delete()
-        val vaultRemoved = vault.delete(vaultFile)
+        records.saveResidue(record.id, OriginalResidue.ORIGINAL_PRESENT, record.cutResult, nowMillis)
+        when (val result = records.transition(record.id, QuarantineState.RESTORED, QuarantineActor.USER_ACTION, nowMillis)) {
+            is QuarantineTransitionResult.Rejected -> return RestoreOutcome.Failed(result.code)
+            is QuarantineTransitionResult.Accepted -> Unit
+        }
+        val vaultRelease = releaseVaultEntry(vaultFile, record.id)
         records.updateRestoreInfo(
             record.id,
             "method=file_restore;destination_kind=${destination.kind};destination=${destination.location}" +
-                ";vault_copy=${if (vaultRemoved) "removed" else "removal_failed"}",
+                ";vault_copy=${vaultRelease.restoreInfoCode}",
             nowMillis
         )
-        records.saveResidue(record.id, OriginalResidue.ORIGINAL_PRESENT, record.cutResult, nowMillis)
-        return when (val result = records.transition(record.id, QuarantineState.RESTORED, QuarantineActor.USER_ACTION, nowMillis)) {
-            is QuarantineTransitionResult.Accepted -> RestoreOutcome.Restored(destination)
-            is QuarantineTransitionResult.Rejected -> RestoreOutcome.Failed(result.code)
-        }
+        return RestoreOutcome.Restored(destination)
     }
 
     fun deleteRecord(
@@ -236,7 +247,16 @@ class VaultCutEngine(
     ): DeleteOutcome {
         val record = records.load(recordId) ?: return DeleteOutcome.Failed(CutResultCodes.FAILED_RECORD_NOT_FOUND)
         if (!QuarantineHonesty.isFileRecord(record)) return DeleteOutcome.Failed(CutResultCodes.FAILED_NOT_FILE_RECORD)
-        if (record.state != QuarantineState.QUARANTINED && record.state != QuarantineState.FAILED) {
+        if (record.state !in setOf(
+                QuarantineState.QUARANTINED,
+                QuarantineState.FAILED,
+                QuarantineState.VAULT_QUOTA_EXCEEDED
+            )
+        ) {
+            return DeleteOutcome.Failed(CutResultCodes.FAILED_NOT_QUARANTINED)
+        }
+        if (alsoDeleteOriginal && record.state == QuarantineState.VAULT_QUOTA_EXCEEDED) {
+            // No verified vault copy exists; never offer/perform cut-and-paste from this state.
             return DeleteOutcome.Failed(CutResultCodes.FAILED_NOT_QUARANTINED)
         }
         if (alsoDeleteOriginal && QuarantineHonesty.originalRemovalPending(record)) {
@@ -247,12 +267,18 @@ class VaultCutEngine(
                 is CutOutcome.Failed -> return DeleteOutcome.Failed(cut.code)
             }
         }
-        record.vaultFileName?.let { vault.delete(it) }
         return when (val result = records.transition(record.id, QuarantineState.DELETED, QuarantineActor.USER_ACTION, nowMillis)) {
-            is QuarantineTransitionResult.Accepted ->
+            is QuarantineTransitionResult.Accepted -> {
+                record.vaultFileName?.let { releaseVaultEntry(it, record.id) }
                 DeleteOutcome.Deleted(QuarantineHonesty.effectiveResidue(result.record) ?: OriginalResidue.ORIGINAL_PRESENT)
+            }
             is QuarantineTransitionResult.Rejected -> DeleteOutcome.Failed(result.code)
         }
+    }
+
+    private fun releaseVaultEntry(fileName: String, recordId: String): VaultReleaseResult {
+        if (records.hasOtherVaultReferences(fileName, recordId)) return VaultReleaseResult.RETAINED_SHARED
+        return if (vault.delete(fileName)) VaultReleaseResult.DELETED else VaultReleaseResult.FAILED
     }
 
     private fun confirmRemoved(record: QuarantineRecord, method: String, nowMillis: Long): CutOutcome {

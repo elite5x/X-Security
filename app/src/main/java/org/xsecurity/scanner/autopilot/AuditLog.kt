@@ -4,7 +4,6 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileOutputStream
 import java.util.UUID
 
 /** A content-free, append-only decision record. */
@@ -43,43 +42,37 @@ data class AuditRecord(
 }
 
 /**
- * Local append-only JSONL audit store. There is intentionally no clear, update,
- * or truncate operation. Arbitrary text is not accepted by [AuditRecord].
+ * Local, bounded-retention JSONL audit store. The active file and one rotated backup are capped
+ * at 5 MiB each (10 MiB total); older records are discarded at rotation. Arbitrary text is not
+ * accepted by [AuditRecord]. Callers fail closed if a durable append or rotation fails.
  */
 object AuditLog {
-    const val FILE_NAME = "autopilot-audit.jsonl"
+    const val FILE_NAME = BoundedAuditLogFiles.FILE_NAME
+    const val ROTATED_FILE_NAME = BoundedAuditLogFiles.BACKUP_FILE_NAME
+    const val MAX_FILE_BYTES = BoundedAuditLogFiles.MAX_FILE_BYTES
+    const val MAX_TOTAL_BYTES = BoundedAuditLogFiles.MAX_TOTAL_BYTES
     private val lock = Any()
 
-    fun file(context: Context): File = File(File(context.filesDir, "autopilot"), FILE_NAME)
+    fun file(context: Context): File = File(File(context.applicationContext.filesDir, "autopilot"), FILE_NAME)
 
-    /** Returns false on storage failure; callers must not execute automation without a durable audit. */
+    fun rotatedFile(context: Context): File = File(File(context.applicationContext.filesDir, "autopilot"), ROTATED_FILE_NAME)
+
+    /** Returns false on storage/rotation failure; callers must not execute without a durable audit. */
     fun append(context: Context, record: AuditRecord): Boolean = synchronized(lock) {
         val target = file(context.applicationContext)
-        try {
-            target.parentFile?.mkdirs()
-            FileOutputStream(target, true).use { stream ->
-                val line = encode(record) + "\n"
-                stream.write(line.toByteArray(Charsets.UTF_8))
-                stream.fd.sync()
-            }
-            true
-        } catch (_: Exception) {
-            false
-        }
+        val directory = target.parentFile ?: return@synchronized false
+        BoundedAuditLogFiles(directory).appendLine(encode(record))
     }
 
-    /** Most recent valid records; reading never rewrites the audit file. */
+    /** Most recent valid records across the retained backup and active file, newest first. */
     fun read(context: Context, limit: Int = 500): List<AuditRecord> {
+        if (limit <= 0) return emptyList()
         val target = file(context.applicationContext)
-        if (!target.isFile || limit <= 0) return emptyList()
-        return runCatching {
-            target.useLines { lines ->
-                lines.mapNotNull { line -> runCatching { decode(line) }.getOrNull() }
-                    .toList()
-                    .takeLast(limit)
-                    .asReversed()
-            }
-        }.getOrDefault(emptyList())
+        val directory = target.parentFile ?: return emptyList()
+        val lines = synchronized(lock) { BoundedAuditLogFiles(directory).readLinesOldestFirst() }
+        return lines.mapNotNull { line -> runCatching { decode(line) }.getOrNull() }
+            .takeLast(limit)
+            .asReversed()
     }
 
     fun encode(record: AuditRecord): String {

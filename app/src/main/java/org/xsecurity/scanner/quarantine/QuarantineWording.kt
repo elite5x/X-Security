@@ -12,6 +12,8 @@ object QuarantineWording {
     const val KEY_STATE_COPY_SAVED_ORIGINAL_PRESENT = "quarantine_display_copy_saved_original_present"
     const val KEY_STATE_QUARANTINED_ORIGINAL_REMOVED = "quarantine_display_quarantined_original_removed"
     const val KEY_STATE_COPY_DELETED_ORIGINAL_PRESENT = "quarantine_display_copy_deleted_original_present"
+    const val KEY_STATE_VAULT_QUOTA_EXCEEDED = "quarantine_display_vault_quota_exceeded"
+    const val KEY_STATE_NO_COPY_RECORD_DELETED_ORIGINAL_PRESENT = "quarantine_display_no_copy_record_deleted_original_present"
     const val KEY_RESIDUE_PRESENT = "quarantine_residue_present"
     const val KEY_RESIDUE_REMOVED = "quarantine_residue_removed"
 
@@ -20,6 +22,9 @@ object QuarantineWording {
     const val KEY_NOTIF_STAGED_BODY = "quarantine_file_staged_body"
     const val KEY_NOTIF_REMOVED_TITLE = "quarantine_file_removed_title"
     const val KEY_NOTIF_REMOVED_BODY = "quarantine_file_removed_body"
+    const val KEY_NOTIF_VAULT_LIMIT_TITLE = "quarantine_file_vault_limit_title"
+    const val KEY_NOTIF_VAULT_LIMIT_BODY = "quarantine_file_vault_limit_body"
+    const val KEY_VAULT_QUOTA_CARD_HINT = "quarantine_vault_quota_card_hint"
     const val KEY_ACTION_DELETE_NOW = "quarantine_file_action_delete_now"
     const val KEY_ACTION_OPEN_QUARANTINE = "autopilot_open_quarantine"
 
@@ -64,9 +69,14 @@ object QuarantineWording {
     val originalPresentKeys: Set<String> = setOf(
         KEY_STATE_COPY_SAVED_ORIGINAL_PRESENT,
         KEY_STATE_COPY_DELETED_ORIGINAL_PRESENT,
+        KEY_STATE_VAULT_QUOTA_EXCEEDED,
+        KEY_STATE_NO_COPY_RECORD_DELETED_ORIGINAL_PRESENT,
         KEY_RESIDUE_PRESENT,
         KEY_NOTIF_STAGED_TITLE,
         KEY_NOTIF_STAGED_BODY,
+        KEY_NOTIF_VAULT_LIMIT_TITLE,
+        KEY_NOTIF_VAULT_LIMIT_BODY,
+        KEY_VAULT_QUOTA_CARD_HINT,
         KEY_SCAN_RESULT_STAGED,
         KEY_CUT_RESULT_DENIED,
         KEY_CUT_RESULT_FAILED
@@ -104,6 +114,9 @@ object QuarantineWording {
         QuarantineDisplayState.FILE_COPY_SAVED_ORIGINAL_PRESENT -> KEY_STATE_COPY_SAVED_ORIGINAL_PRESENT
         QuarantineDisplayState.FILE_QUARANTINED_ORIGINAL_REMOVED -> KEY_STATE_QUARANTINED_ORIGINAL_REMOVED
         QuarantineDisplayState.FILE_COPY_DELETED_ORIGINAL_PRESENT -> KEY_STATE_COPY_DELETED_ORIGINAL_PRESENT
+        QuarantineDisplayState.VAULT_QUOTA_EXCEEDED -> KEY_STATE_VAULT_QUOTA_EXCEEDED
+        QuarantineDisplayState.FILE_NO_COPY_RECORD_DELETED_ORIGINAL_PRESENT ->
+            KEY_STATE_NO_COPY_RECORD_DELETED_ORIGINAL_PRESENT
         else -> null
     }
 

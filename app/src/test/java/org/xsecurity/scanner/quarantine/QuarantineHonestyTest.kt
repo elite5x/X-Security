@@ -22,6 +22,7 @@ class QuarantineHonestyTest {
         detectedAtMillis = 1,
         updatedAtMillis = 1,
         state = state,
+        vaultFileName = if (state == QuarantineState.VAULT_QUOTA_EXCEEDED) null else "r.xsv",
         residue = residue,
         sourcePath = "/storage/emulated/0/Download/bad.apk"
     )
@@ -62,6 +63,21 @@ class QuarantineHonestyTest {
         assertEquals(QuarantineDisplayState.FILE_QUARANTINED_ORIGINAL_REMOVED, QuarantineHonesty.displayState(cut))
         assertFalse(QuarantineHonesty.originalRemovalPending(cut))
         assertTrue(QuarantineHonesty.mayClaimFullQuarantine(cut))
+    }
+
+    @Test
+    fun quotaFailureNeverClaimsAStagedCopyAndKeepsTheOriginalPresent() {
+        val limited = record(QuarantineState.VAULT_QUOTA_EXCEEDED, OriginalResidue.ORIGINAL_PRESENT)
+        assertEquals(QuarantineDisplayState.VAULT_QUOTA_EXCEEDED, QuarantineHonesty.displayState(limited))
+        assertEquals(OriginalResidue.ORIGINAL_PRESENT, QuarantineHonesty.effectiveResidue(limited))
+        assertFalse(QuarantineHonesty.originalRemovalPending(limited))
+        assertFalse(QuarantineHonesty.mayClaimFullQuarantine(limited))
+
+        val dismissed = limited.copy(state = QuarantineState.DELETED)
+        assertEquals(
+            QuarantineDisplayState.FILE_NO_COPY_RECORD_DELETED_ORIGINAL_PRESENT,
+            QuarantineHonesty.displayState(dismissed)
+        )
     }
 
     @Test

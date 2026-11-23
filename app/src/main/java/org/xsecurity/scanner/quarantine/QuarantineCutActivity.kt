@@ -170,12 +170,13 @@ class QuarantineCutActivity : ComponentActivity() {
     }
 
     private fun startDeleteRecord(alsoDeleteOriginal: Boolean) {
+        val hadVaultCopy = record?.vaultFileName != null
         phase = Phase.Working
         lifecycleScope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 VaultDeleteFlow.deleteRecord(this@QuarantineCutActivity, recordId, alsoDeleteOriginal)
             }
-            showDelete(outcome)
+            showDelete(outcome, hadVaultCopy)
         }
     }
 
@@ -189,15 +190,20 @@ class QuarantineCutActivity : ComponentActivity() {
         reloadRecord()
     }
 
-    private fun showDelete(outcome: DeleteOutcome) {
+    private fun showDelete(outcome: DeleteOutcome, hadVaultCopy: Boolean = true) {
         when (outcome) {
             is DeleteOutcome.NeedsUserConfirmation -> {
                 finishRecordDeleteAfterCut = true
                 launchSystemConfirmation(outcome.token, outcome.route)
             }
             is DeleteOutcome.Deleted -> done(
-                if (outcome.residue == OriginalResidue.ORIGINAL_REMOVED) getString(R.string.quarantine_delete_record_done_original_removed)
-                else getString(R.string.quarantine_delete_record_done_original_present),
+                when {
+                    outcome.residue == OriginalResidue.ORIGINAL_REMOVED ->
+                        getString(R.string.quarantine_delete_record_done_original_removed)
+                    !hadVaultCopy && outcome.residue == OriginalResidue.ORIGINAL_PRESENT ->
+                        getString(R.string.quarantine_delete_record_done_no_vault_original_present)
+                    else -> getString(R.string.quarantine_delete_record_done_original_present)
+                },
                 removed = outcome.residue == OriginalResidue.ORIGINAL_REMOVED
             )
             DeleteOutcome.Denied -> done(resolve(QuarantineWording.KEY_CUT_RESULT_DENIED), removed = false, canRetry = true)
@@ -300,8 +306,12 @@ class QuarantineCutActivity : ComponentActivity() {
                         Text(getString(R.string.quarantine_delete_record_title), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(12.dp))
                         Text(
-                            if (pending) getString(R.string.quarantine_delete_record_body_original_present, label)
-                            else getString(R.string.quarantine_delete_record_body, label)
+                            when {
+                                pending -> getString(R.string.quarantine_delete_record_body_original_present, label)
+                                record?.isFileRecord == true && record?.vaultFileName == null ->
+                                    getString(R.string.quarantine_delete_record_body_no_vault, label)
+                                else -> getString(R.string.quarantine_delete_record_body, label)
+                            }
                         )
                         Spacer(Modifier.height(20.dp))
                         if (pending) {

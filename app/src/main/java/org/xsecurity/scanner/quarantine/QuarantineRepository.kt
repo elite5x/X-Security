@@ -86,10 +86,30 @@ object QuarantineRepository {
         )
     }
 
+    /** Same-content blob candidates across file and package records; only QUARANTINED rows qualify. */
+    fun quarantinedVaultRecordsBySha256(context: Context, sha256: String?): List<QuarantineRecord> =
+        synchronized(lock) {
+            val hash = sha256?.trim()?.takeIf { it.isNotEmpty() } ?: return@synchronized emptyList()
+            db(context).all().filter { record ->
+                record.state == QuarantineState.QUARANTINED &&
+                    record.sha256?.equals(hash, ignoreCase = true) == true &&
+                    !record.vaultFileName.isNullOrBlank()
+            }
+        }
+
+    /** True if another live metadata row still needs this encrypted blob for restore/verification. */
+    fun hasOtherVaultReferences(context: Context, fileName: String, excludingRecordId: String): Boolean =
+        synchronized(lock) {
+            db(context).all().any { record ->
+                record.id != excludingRecordId && record.vaultFileName == fileName &&
+                    record.state !in setOf(QuarantineState.RESTORED, QuarantineState.DELETED, QuarantineState.CANCELLED)
+            }
+        }
+
     /**
      * Update-in-place for a re-scanned case (same identity, new timestamps/state). The record id
-     * is preserved, so the UI keeps showing one row; the superseded vault copy is deleted by the
-     * caller only after the new copy verified.
+     * is preserved, so the UI keeps showing one row; the caller releases a superseded blob only
+     * after verification/reuse and only when no other live row references it.
      */
     fun saveReobserved(context: Context, record: QuarantineRecord): QuarantineRecord = synchronized(lock) {
         db(context).save(record)

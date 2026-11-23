@@ -6,7 +6,9 @@ package org.xsecurity.scanner.quarantine
  * Identity is `sha256 + sourcePath` (when the path is known) or `sha256 + sourceUri`
  * otherwise. A re-scan of the same identity UPDATES the existing row — new timestamps and
  * state — instead of appending a second one. A different path with the same bytes stays a
- * separate record: the user may hold the same file in two places.
+ * separate metadata record: the user may hold the same file in two places, but both rows may
+ * safely reference one verified encrypted blob. VaultCutEngine releases that blob only after the
+ * last non-terminal record stops referencing it.
  *
  * A re-observation only ever (re-)stages the encrypted copy, so no user-action gate is
  * bypassed: the original is still removed solely by the explicit "Delete now" tap.
@@ -43,8 +45,22 @@ object RecordDedup {
     ): QuarantineRecord? = candidates.firstOrNull { isSameCase(it, sha256, sourcePath, sourceUri) }
 
     /**
-     * Update-in-place for a re-observation: new vault copy, new timestamps, QUARANTINED with the
-     * original (again) on the device. Null arguments keep the previously known value.
+     * Content-identical bytes may reuse an existing encrypted blob only while its record is
+     * QUARANTINED. This includes installed-package APK backups and file records; their metadata
+     * rows remain distinct, and reference-aware release keeps the shared blob alive as needed.
+     */
+    fun findReusableVaultRecord(candidates: List<QuarantineRecord>, sha256: String?): QuarantineRecord? {
+        val hash = sha256?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return candidates.firstOrNull { candidate ->
+            candidate.state == QuarantineState.QUARANTINED &&
+                candidate.sha256?.equals(hash, ignoreCase = true) == true &&
+                !candidate.vaultFileName.isNullOrBlank()
+        }
+    }
+
+    /**
+     * Update-in-place for a re-observation: a verified or deduplicated vault copy, new timestamps,
+     * and QUARANTINED with the original (again) on the device. Null arguments keep previous values.
      */
     fun reobserved(
         existing: QuarantineRecord,
@@ -73,5 +89,36 @@ object RecordDedup {
         failureCode = null,
         residue = OriginalResidue.ORIGINAL_PRESENT,
         cutResult = null
+    )
+
+    /** Re-observation that could not be backed up: retain the original and record the precise limit. */
+    fun vaultQuotaExceeded(
+        existing: QuarantineRecord,
+        sha256: String?,
+        label: String?,
+        engine: String?,
+        sizeBytes: Long?,
+        scanOrigin: String?,
+        sourcePath: String?,
+        sourceUri: String?,
+        failureCode: String,
+        nowMillis: Long
+    ): QuarantineRecord = existing.copy(
+        label = label?.take(120)?.takeIf { it.isNotBlank() } ?: existing.label,
+        sha256 = sha256 ?: existing.sha256,
+        engine = engine?.takeIf { it.isNotBlank() } ?: existing.engine,
+        sizeBytes = sizeBytes ?: existing.sizeBytes,
+        scanOrigin = scanOrigin ?: existing.scanOrigin,
+        vaultFileName = null,
+        restoreInfo = "encrypted_file_vault_not_saved",
+        sourcePath = sourcePath ?: existing.sourcePath,
+        sourceUri = sourceUri ?: existing.sourceUri,
+        verdict = "KNOWN_BAD",
+        detectedAtMillis = nowMillis,
+        updatedAtMillis = nowMillis,
+        state = QuarantineState.VAULT_QUOTA_EXCEEDED,
+        failureCode = failureCode,
+        residue = OriginalResidue.ORIGINAL_PRESENT,
+        cutResult = failureCode
     )
 }
